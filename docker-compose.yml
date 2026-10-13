@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./services/backend
+      dockerfile: Dockerfile
+    container_name: ephemeral-backend
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - TCP_BACKLOG=128
+      - TCP_NODELAY=1
+      - SO_REUSEPORT=1
+    # Tuned kernel parameters exposed directly in the container network namespace
+    sysctls:
+      net.core.somaxconn: 128
+      net.ipv4.tcp_max_syn_backlog: 128
+      net.ipv4.ip_local_port_range: "32768 33279"
+      net.ipv4.tcp_tw_reuse: 0
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
+    networks:
+      - mesh-net
+
+  ebpf-probe:
+    build:
+      context: ./services/ebpf-probe
+      dockerfile: Dockerfile
+    container_name: ephemeral-probe
+    # Share network namespace with backend to capture netstat/listen queue metrics directly
+    network_mode: "service:backend"
+    pid: "host"
+    privileged: true
+    volumes:
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /lib/modules:/lib/modules:ro
+      - /usr/src:/usr/src:ro
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  traffic-generator:
+    build:
+      context: ./services/traffic-generator
+      dockerfile: Dockerfile
+    container_name: ephemeral-generator
+    environment:
+      - TARGET_URL=http://backend:8080
+      - SCENARIO=bench
+    depends_on:
+      - backend
+    networks:
+      - mesh-net
+
+networks:
+  mesh-net:
+    driver: bridge

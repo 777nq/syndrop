@@ -1,0 +1,29 @@
+# Binaries & build artifacts
+target/
+**/*.rs.bk
+*.o
+*.so
+*.a
+bin/
+traffic-generator
+
+# Go artifacts
+*.exe
+*.test
+*.prof
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Docker & local mounts
+.env
+*.log
+
+# OS & IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
