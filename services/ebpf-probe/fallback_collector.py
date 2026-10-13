@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-ephemeral-collapse: Kernel Procfs / Netlink Diagnostic Collector
-Monitors kernel socket state, listen queue drops (ListenOverflows, ListenDrops),
-nf_conntrack table saturation, and TIME_WAIT bucket overflow with sub-second resolution.
-Serves as universal zero-dependency telemetry engine.
+syndrop: Pure /proc Fallback Reader
+Samples /proc/net/netstat at 100ms intervals to compute exact deltas on ListenOverflows and ListenDrops.
+Guarantees operation in rootless containers, macOS Docker VMs, and kernels without eBPF kprobe support.
 """
 
-import os
 import sys
 import time
 from datetime import datetime
@@ -19,11 +17,9 @@ def read_file(path):
         return None
 
 def parse_netstat():
-    """Parses /proc/net/netstat for ListenOverflows, ListenDrops, and TCPTimeWaitOverflow"""
     content = read_file("/proc/net/netstat")
     if not content:
         return {}
-
     lines = content.splitlines()
     data = {}
     for i in range(0, len(lines), 2):
@@ -39,11 +35,9 @@ def parse_netstat():
     return data
 
 def parse_sockstat():
-    """Parses /proc/net/sockstat for TCP sockets inuse, tw, alloc, mem"""
     content = read_file("/proc/net/sockstat")
     if not content:
         return {}
-
     data = {}
     for line in content.splitlines():
         parts = line.split()
@@ -62,74 +56,65 @@ def parse_sockstat():
     return data
 
 def parse_conntrack():
-    """Parses nf_conntrack count and max"""
     count_str = read_file("/proc/sys/net/netfilter/nf_conntrack_count")
     max_str = read_file("/proc/sys/net/netfilter/nf_conntrack_max")
-    
     count = int(count_str) if count_str and count_str.isdigit() else 0
     max_val = int(max_str) if max_str and max_str.isdigit() else 0
     return count, max_val
 
-def render_gauge(used, max_val, width=20):
-    if max_val <= 0:
-        return "[?]"
-    ratio = min(1.0, max(0.0, used / float(max_val)))
-    filled = int(ratio * width)
-    bar = "=" * filled + "-" * (width - filled)
-    return f"[{bar}] {ratio*100.0:5.1f}% ({used}/{max_val})"
-
 def main():
     print("===============================================================================")
-    print("  ephemeral-collapse: Kernel Seam Telemetry Collector (/proc/net & conntrack)")
-    print("  Monitoring: ListenOverflows | ListenDrops | TIME_WAIT | nf_conntrack_max")
+    print("  syndrop: /proc Fallback Reader (100ms Resolution)")
+    print("  Polling: /proc/net/netstat [ListenOverflows, ListenDrops, TCPTimeWaitOverflow]")
     print("===============================================================================")
 
     prev_netstat = parse_netstat()
-    last_print = time.time()
+    last_heartbeat = time.time()
 
     while True:
-        time.sleep(1.0)
+        time.sleep(0.1) # Exact 100ms sampling window
         curr_netstat = parse_netstat()
-        sockstat = parse_sockstat()
-        ct_count, ct_max = parse_conntrack()
+        now = time.time()
 
-        # Calculate delta drops
-        listen_overflows_delta = (
+        overflow_delta = (
             curr_netstat.get("TcpExt.ListenOverflows", 0) -
             prev_netstat.get("TcpExt.ListenOverflows", 0)
         )
-        listen_drops_delta = (
+        drop_delta = (
             curr_netstat.get("TcpExt.ListenDrops", 0) -
             prev_netstat.get("TcpExt.ListenDrops", 0)
         )
-        tw_overflow_delta = (
+        tw_delta = (
             curr_netstat.get("TcpExt.TCPTimeWaitOverflow", 0) -
             prev_netstat.get("TcpExt.TCPTimeWaitOverflow", 0)
         )
 
-        total_overflows = curr_netstat.get("TcpExt.ListenOverflows", 0)
-        total_drops = curr_netstat.get("TcpExt.ListenDrops", 0)
-        tcp_inuse = sockstat.get("TCP.inuse", 0)
-        tcp_tw = sockstat.get("TCP.tw", 0)
-        tcp_alloc = sockstat.get("TCP.alloc", 0)
+        now_str = datetime.utcfromtimestamp(now).strftime("%H:%M:%S.%f")[:-3]
 
-        now_str = datetime.utcfromtimestamp(time.time()).strftime("%H:%M:%S")
-
-        status_marker = "NOMINAL"
-        if listen_overflows_delta > 0 or listen_drops_delta > 0:
-            status_marker = "!! BACKLOG DROPS !!"
-        elif tw_overflow_delta > 0:
-            status_marker = "!! TIME_WAIT OVERFLOW !!"
-        elif ct_max > 0 and (ct_count / ct_max) > 0.85:
-            status_marker = "!! CONNTRACK SATURATION !!"
-
-        print(
-            f"[{now_str}] [{status_marker:26}] "
-            f"ListenOverflows: +{listen_overflows_delta:<4} (tot: {total_overflows:<5}) | "
-            f"ListenDrops: +{listen_drops_delta:<4} (tot: {total_drops:<5}) | "
-            f"TCP inuse: {tcp_inuse:<5} tw: {tcp_tw:<5} | "
-            f"Conntrack: {render_gauge(ct_count, ct_max)}"
-        )
+        if overflow_delta > 0 or drop_delta > 0:
+            total_drops = curr_netstat.get("TcpExt.ListenDrops", 0)
+            total_overflows = curr_netstat.get("TcpExt.ListenOverflows", 0)
+            print(
+                f"[{now_str}] [KERNEL SEAM ALERT] ListenDrops: +{drop_delta:<4} (total: {total_drops}) | "
+                f"ListenOverflows: +{overflow_delta:<4} (total: {total_overflows}) | "
+                f"RATE: {drop_delta * 10} drops/sec"
+            )
+            last_heartbeat = now
+        elif tw_delta > 0:
+            print(f"[{now_str}] [KERNEL SEAM ALERT] TCPTimeWaitOverflow: +{tw_delta}")
+            last_heartbeat = now
+        elif now - last_heartbeat >= 1.0:
+            # 1-second nominal status heartbeat
+            sockstat = parse_sockstat()
+            ct_count, ct_max = parse_conntrack()
+            tcp_inuse = sockstat.get("TCP.inuse", 0)
+            tcp_tw = sockstat.get("TCP.tw", 0)
+            ct_info = f"{ct_count}/{ct_max}" if ct_max > 0 else f"{ct_count}"
+            print(
+                f"[{now_str}] [NOMINAL] Sockets inuse: {tcp_inuse:<4} tw: {tcp_tw:<4} | "
+                f"ListenDrops: 0 | Conntrack: {ct_info}"
+            )
+            last_heartbeat = now
 
         prev_netstat = curr_netstat
 

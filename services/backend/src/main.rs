@@ -1,280 +1,213 @@
-//! ephemeral-backend: High-Throughput Kernel-Tuned Async Microservice
-//!
-//! Exposes kernel-level socket knobs via `socket2` and tracks epoll event loop lag,
-//! active connections, and connection churn to expose kernel-seam degradation.
+//! syndrop-backend: Low-latency raw Tokio TCP HTTP server with socket2 kernel tuning.
 
-use bytes::{BufMut, BytesMut};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::env;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
-static TOTAL_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
-static CHURN_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
-static BYTES_RECEIVED: AtomicU64 = AtomicU64::new(0);
-static BYTES_SENT: AtomicU64 = AtomicU64::new(0);
-static EPOLL_LAG_MICROS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
-struct ServerConfig {
+const BENCH_RESPONSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
+
+const CHURN_RESPONSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nCHURN";
+
+const NOT_FOUND_RESPONSE: &[u8] =
+    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+#[derive(Debug)]
+struct CliConfig {
     port: u16,
     backlog: i32,
     reuse_port: bool,
     tcp_nodelay: bool,
-    rcvbuf_size: Option<usize>,
-    sndbuf_size: Option<usize>,
 }
 
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            port: env::var("PORT")
-                .unwrap_or_else(|_| "8080".to_string())
-                .parse()
-                .unwrap_or(8080),
-            backlog: env::var("TCP_BACKLOG")
-                .unwrap_or_else(|_| "128".to_string())
-                .parse()
-                .unwrap_or(128),
-            reuse_port: env::var("SO_REUSEPORT")
-                .unwrap_or_else(|_| "1".to_string())
-                == "1",
-            tcp_nodelay: env::var("TCP_NODELAY")
-                .unwrap_or_else(|_| "1".to_string())
-                == "1",
-            rcvbuf_size: env::var("SO_RCVBUF").ok().and_then(|v| v.parse().ok()),
-            sndbuf_size: env::var("SO_SNDBUF").ok().and_then(|v| v.parse().ok()),
+impl CliConfig {
+    fn parse() -> Self {
+        let args: Vec<String> = env::args().collect();
+        let mut port = 8080u16;
+        let mut backlog = 128i32;
+        let mut reuse_port = true;
+        let mut tcp_nodelay = true;
+
+        if let Ok(p) = env::var("PORT") {
+            if let Ok(val) = p.parse() {
+                port = val;
+            }
+        }
+        if let Ok(b) = env::var("TCP_BACKLOG") {
+            if let Ok(val) = b.parse() {
+                backlog = val;
+            }
+        }
+
+        let mut i = 1;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--port" | "-p" => {
+                    if i + 1 < args.len() {
+                        if let Ok(val) = args[i + 1].parse() {
+                            port = val;
+                        }
+                        i += 1;
+                    }
+                }
+                "--backlog" | "-b" => {
+                    if i + 1 < args.len() {
+                        if let Ok(val) = args[i + 1].parse() {
+                            backlog = val;
+                        }
+                        i += 1;
+                    }
+                }
+                "--no-reuseport" => {
+                    reuse_port = false;
+                }
+                "--no-nodelay" => {
+                    tcp_nodelay = false;
+                }
+                "--help" | "-h" => {
+                    println!("syndrop-backend options:");
+                    println!("  --port, -p <n>       Listen port (default: 8080)");
+                    println!("  --backlog, -b <n>    Listen queue backlog (default: 128)");
+                    println!("  --no-reuseport       Disable SO_REUSEPORT");
+                    println!("  --no-nodelay         Disable TCP_NODELAY");
+                    std::process::exit(0);
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+
+        CliConfig {
+            port,
+            backlog,
+            reuse_port,
+            tcp_nodelay,
         }
     }
 }
 
-fn create_kernel_tuned_listener(config: &ServerConfig) -> std::io::Result<std::net::TcpListener> {
-    let addr: SocketAddr = format!("0.0.0.0:{}", config.port)
+fn create_listener(cfg: &CliConfig) -> io::Result<TcpListener> {
+    let addr: SocketAddr = format!("0.0.0.0:{}", cfg.port)
         .parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let domain = Domain::IPV4;
-    let socket_type = Type::STREAM;
-    let protocol = Some(Protocol::TCP);
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-    let socket = Socket::new(domain, socket_type, protocol)?;
-
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
 
     #[cfg(unix)]
-    if config.reuse_port {
-        if let Err(e) = socket.set_reuse_port(true) {
-            eprintln!("[WARN] Failed to set SO_REUSEPORT: {}", e);
-        }
+    if cfg.reuse_port {
+        let _ = socket.set_reuse_port(true);
     }
 
-    if let Some(rcv) = config.rcvbuf_size {
-        let _ = socket.set_recv_buffer_size(rcv);
-    }
-    if let Some(snd) = config.sndbuf_size {
-        let _ = socket.set_send_buffer_size(snd);
-    }
-
-    // Set non-blocking mode required for Tokio async runtime
     socket.set_nonblocking(true)?;
-
     let sock_addr = socket2::SockAddr::from(addr);
     socket.bind(&sock_addr)?;
+    socket.listen(cfg.backlog)?;
 
-    // Listen with explicitly tuned backlog (key seam point for backlog drop testing)
-    socket.listen(config.backlog)?;
-    println!(
-        "[INIT] Socket bound to {} with listen backlog = {} (SO_REUSEPORT={})",
-        addr, config.backlog, config.reuse_port
-    );
-
-    Ok(socket.into())
+    let std_listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(std_listener)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = ServerConfig::default();
-    let start_time = Instant::now();
+    let cfg = CliConfig::parse();
+    let listener = create_listener(&cfg)?;
 
-    println!("===============================================================");
-    println!(" ephemeral-collapse: High-Throughput Kernel-Tuned Backend");
-    println!(" Bound Port:       {}", config.port);
-    println!(" Listen Backlog:   {} (somaxconn ceiling test target)", config.backlog);
-    println!(" TCP_NODELAY:      {}", config.tcp_nodelay);
-    println!(" SO_REUSEPORT:     {}", config.reuse_port);
-    println!(" Worker Threads:   {}", tokio::runtime::Handle::current().metrics().num_workers());
-    println!("===============================================================");
+    eprintln!(
+        "[syndrop-backend] Listening on 0.0.0.0:{} (backlog={}, SO_REUSEPORT={}, TCP_NODELAY={})",
+        cfg.port, cfg.backlog, cfg.reuse_port, cfg.tcp_nodelay
+    );
 
-    // Spawn epoll latency / runtime lag monitor task
+    let tcp_nodelay = cfg.tcp_nodelay;
+
+    // Background reporting task
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(50));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let start = Instant::now();
         loop {
-            let tick_start = Instant::now();
             interval.tick().await;
-            let elapsed = tick_start.elapsed();
-            if elapsed > Duration::from_millis(50) {
-                let lag = (elapsed - Duration::from_millis(50)).as_micros() as u64;
-                EPOLL_LAG_MICROS.store(lag, Ordering::Relaxed);
-            } else {
-                EPOLL_LAG_MICROS.store(0, Ordering::Relaxed);
-            }
-        }
-    });
-
-    let std_listener = create_kernel_tuned_listener(&config)?;
-    let listener = TcpListener::from_std(std_listener)?;
-    let tcp_nodelay = config.tcp_nodelay;
-
-    // Background metric reporter
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(5));
-        loop {
-            ticker.tick().await;
-            let reqs = TOTAL_REQUESTS.load(Ordering::Relaxed);
             let active = ACTIVE_CONNECTIONS.load(Ordering::Relaxed);
-            let churn = CHURN_CONNECTIONS.load(Ordering::Relaxed);
-            let lag = EPOLL_LAG_MICROS.load(Ordering::Relaxed);
-            let uptime = start_time.elapsed().as_secs();
-            println!(
-                "[TELEMETRY] uptime={}s | reqs={} | active_conns={} | churn={} | epoll_lag={}us",
-                uptime, reqs, active, churn, lag
+            let total = TOTAL_REQUESTS.load(Ordering::Relaxed);
+            eprintln!(
+                "[syndrop-backend] uptime={:>4}s | active_conns={:>5} | total_reqs={:>9}",
+                start.elapsed().as_secs(),
+                active,
+                total
             );
         }
     });
 
     loop {
         match listener.accept().await {
-            Ok((mut socket, peer_addr)) => {
+            Ok((stream, _)) => {
                 if tcp_nodelay {
-                    let _ = socket.set_nodelay(true);
+                    let _ = stream.set_nodelay(true);
                 }
-
                 ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-
                 tokio::spawn(async move {
-                    handle_connection(&mut socket, peer_addr).await;
+                    handle_client(stream).await;
                     ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Err(e) => {
-                eprintln!("[ACCEPT_ERR] Socket accept failed: {}", e);
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                eprintln!("[syndrop-backend] Accept error: {}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         }
     }
 }
 
-async fn handle_connection(socket: &mut tokio::net::TcpStream, _peer_addr: SocketAddr) {
-    let mut buf = BytesMut::with_capacity(2048);
+async fn handle_client(mut stream: TcpStream) {
+    let mut buf = [0u8; 1024];
 
     loop {
-        match socket.read_buf(&mut buf).await {
-            Ok(0) => break, // EOF / remote closed
+        match stream.read(&mut buf).await {
+            Ok(0) => break, // Peer closed connection
             Ok(n) => {
-                BYTES_RECEIVED.fetch_add(n as u64, Ordering::Relaxed);
                 TOTAL_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                let req_slice = &buf[..n];
 
-                let req_slice = &buf[..];
-                let is_churn = req_slice.windows(6).any(|w| w == b"/churn");
-                let is_metrics = req_slice.windows(8).any(|w| w == b"/metrics");
-                let is_leak = req_slice.windows(5).any(|w| w == b"/leak");
-
-                if is_metrics {
-                    let body = format!(
-                        "# HELP ephemeral_active_connections Current active TCP connections\n\
-                         # TYPE ephemeral_active_connections gauge\n\
-                         ephemeral_active_connections {}\n\
-                         # HELP ephemeral_requests_total Total HTTP requests served\n\
-                         # TYPE ephemeral_requests_total counter\n\
-                         ephemeral_requests_total {}\n\
-                         # HELP ephemeral_connection_churn_total Total closed short-lived connections\n\
-                         # TYPE ephemeral_connection_churn_total counter\n\
-                         ephemeral_connection_churn_total {}\n\
-                         # HELP ephemeral_epoll_lag_microseconds Event loop lag\n\
-                         # TYPE ephemeral_epoll_lag_microseconds gauge\n\
-                         ephemeral_epoll_lag_microseconds {}\n\
-                         # HELP ephemeral_bytes_received_total Raw bytes received\n\
-                         # TYPE ephemeral_bytes_received_total counter\n\
-                         ephemeral_bytes_received_total {}\n\
-                         # HELP ephemeral_bytes_sent_total Raw bytes sent\n\
-                         # TYPE ephemeral_bytes_sent_total counter\n\
-                         ephemeral_bytes_sent_total {}\n",
-                        ACTIVE_CONNECTIONS.load(Ordering::Relaxed),
-                        TOTAL_REQUESTS.load(Ordering::Relaxed),
-                        CHURN_CONNECTIONS.load(Ordering::Relaxed),
-                        EPOLL_LAG_MICROS.load(Ordering::Relaxed),
-                        BYTES_RECEIVED.load(Ordering::Relaxed),
-                        BYTES_SENT.load(Ordering::Relaxed),
-                    );
-
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\n\
-                         Content-Type: text/plain; version=0.0.4\r\n\
-                         Content-Length: {}\r\n\
-                         Connection: keep-alive\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-
-                    if socket.write_all(response.as_bytes()).await.is_err() {
+                // Fast zero-allocation routing check
+                if req_slice.starts_with(b"GET /bench") || req_slice.starts_with(b"GET / ") {
+                    if stream.write_all(BENCH_RESPONSE).await.is_err() {
                         break;
                     }
-                    BYTES_SENT.fetch_add(response.len() as u64, Ordering::Relaxed);
-                } else if is_churn {
-                    // Force immediate socket close to produce TIME_WAIT on server/client
-                    CHURN_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-                    let body = r#"{"status":"churn_closed"}"#;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\n\
-                         Content-Type: application/json\r\n\
-                         Content-Length: {}\r\n\
-                         Connection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = socket.write_all(response.as_bytes()).await;
-                    BYTES_SENT.fetch_add(response.len() as u64, Ordering::Relaxed);
-                    let _ = socket.shutdown().await;
+                } else if req_slice.starts_with(b"GET /churn") {
+                    let _ = stream.write_all(CHURN_RESPONSE).await;
+                    let _ = stream.shutdown().await;
                     break;
-                } else if is_leak {
-                    // Simulate slow drain / buffer pinning
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    let body = r#"{"status":"buffer_retained"}"#;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\n\
-                         Content-Type: application/json\r\n\
-                         Content-Length: {}\r\n\
-                         Connection: keep-alive\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    if socket.write_all(response.as_bytes()).await.is_err() {
+                } else if req_slice.starts_with(b"GET /healthz") {
+                    if stream.write_all(BENCH_RESPONSE).await.is_err() {
                         break;
                     }
-                    BYTES_SENT.fetch_add(response.len() as u64, Ordering::Relaxed);
                 } else {
-                    // Ultra-fast zero-alloc bench response
-                    let body = r#"{"status":"healthy","kernel_seam":"nominal"}"#;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\n\
-                         Content-Type: application/json\r\n\
-                         Content-Length: {}\r\n\
-                         Connection: keep-alive\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    if socket.write_all(response.as_bytes()).await.is_err() {
-                        break;
-                    }
-                    BYTES_SENT.fetch_add(response.len() as u64, Ordering::Relaxed);
+                    let _ = stream.write_all(NOT_FOUND_RESPONSE).await;
+                    break;
                 }
 
-                buf.clear();
+                // If client specified Connection: close, terminate loop
+                if is_connection_close(req_slice) {
+                    break;
+                }
             }
             Err(_) => break,
         }
     }
+}
+
+#[inline]
+fn is_connection_close(slice: &[u8]) -> bool {
+    slice
+        .windows(17)
+        .any(|w| w.eq_ignore_ascii_case(b"connection: close"))
 }
