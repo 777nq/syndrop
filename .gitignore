@@ -5,7 +5,7 @@ target/
 *.so
 *.a
 bin/
-traffic-generator
+/traffic-generator
 
 # Go artifacts
 *.exe
