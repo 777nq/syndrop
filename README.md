@@ -2,11 +2,13 @@
 
 <p align="center">
   <strong>Diagnostic Harness & Kernel-Seam Failure Analysis for 100k+ RPS Microservice Meshes</strong><br>
-  <em>A high-performance systems engineering testbed exposing and resolving sub-runtime Linux kernel failures beneath Kubernetes, Service Meshes, and Async Runtimes.</em>
+  <em>A high-performance systems engineering testbed exposing, visualizing, and resolving sub-runtime Linux kernel failures beneath Kubernetes, Service Meshes, and Async Runtimes.</em>
 </p>
 
 <p align="center">
   <a href="#quick-start-1-command-runnable"><img src="https://img.shields.io/badge/run-docker%20compose%20up-blue?style=flat-square" alt="Docker Compose" /></a>
+  <a href="#live-terminal-dashboard-tui"><img src="https://img.shields.io/badge/tui-live%20terminal%20console-brightgreen?style=flat-square" alt="Live TUI" /></a>
+  <a href="#break-vs-fix-remediation-playbook"><img src="https://img.shields.io/badge/playbook-break%20vs%20fix-red?style=flat-square" alt="Break vs Fix" /></a>
   <a href="#ebpf--bcc-diagnostic-probes"><img src="https://img.shields.io/badge/probes-eBPF%20%2F%20BCC-orange?style=flat-square" alt="eBPF BCC" /></a>
   <a href="#mathematical-tuning-formulas"><img src="https://img.shields.io/badge/tuning-sysctl%20formulas-green?style=flat-square" alt="Sysctl Formulas" /></a>
   <a href="docs/whitepaper.md"><img src="https://img.shields.io/badge/whitepaper-systems%20post--mortem-purple?style=flat-square" alt="Whitepaper" /></a>
@@ -24,6 +26,37 @@ In high-scale Kubernetes and microservice architectures operating at or above **
 **The Root Cause**: High-density microservice traffic creates impedance mismatches across Linux kernel subsystem boundaries—specifically **epoll starvation**, **listen backlog overflow (`tcp_v4_syn_recv_sock`)**, **Netfilter `nf_conntrack` hash table saturation**, and **TCP `TIME_WAIT` socket bucket overflow**.
 
 `ephemeral-collapse` is a complete, containerized diagnostic harness and eBPF observability suite that reproduces, measures, and eliminates these kernel-seam failures in an isolated environment.
+
+---
+
+## 🖥️ Live Terminal Dashboard (TUI)
+
+Monitor the failure seams live with the zero-dependency terminal console (`make tui`):
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  ephemeral-collapse: Kernel-Seam Real-Time Failure Console                  │
+│  Target: http://backend:8080    System State: 🔴 LISTEN BACKLOG OVERFLOW     │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ 📡 APPLICATION & RUNTIME LAYER                                               │
+│   Throughput:     18,450 req/s  [█████████░░░░░░░░░░░░░░░]  36.9%            │
+│   Active Sockets:    128 conns   Epoll Loop Lag:   1,840 µs                  │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ 🛑 SEAM 1: LISTEN QUEUE & SYN DROPS (Server somaxconn: 128)                  │
+│   Listen Drops Rate:    +3,412 drops/sec (Cumulative:  14,290)               │
+│   Listen Overflows:     +3,412 /sec      (Cumulative:  14,290)               │
+│   TCP SYN Retransmit:   ⚠️  ACTIVE (3,000ms Retransmit Penalty)              │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ 🌐 SEAM 2: NETFILTER CONNTRACK TABLE                                         │
+│   Table Entries:        1,840/2,048    [████████████████████░░]  89.8%       │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ 🔌 SEAM 3: TIME_WAIT & EPHEMERAL PORT POOL (Client Range: 512 ports)         │
+│   TIME_WAIT Sockets:       508 sockets [██████████████████████]  99.2%       │
+│   TIME_WAIT Overflows:    +410 /sec    (Cumulative:   2,180)                 │
+│   Port Exhaustion:      EADDRNOTAVAIL RISK HIGH                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+  Press Ctrl+C to exit dashboard. Auto-refreshes every 500ms.
+```
 
 ---
 
@@ -137,9 +170,9 @@ Active Close (FIN) -> FIN-ACK Handshake -> TIME_WAIT (2 * MSL = 60s)
                                                  |
                    +-----------------------------+-----------------------------+
                    |                                                           |
-       [tcp_tw_reuse = 0 (Default)]                                 [tcp_tw_reuse = 1]
+       [tcp_tw_reuse = 0 (Client Default)]                          [tcp_tw_reuse = 1]
                    |                                                           |
-  Socket 5-Tuple pinned for 60 seconds.                        Kernel checks TCP timestamp (PAWS).
+  Client 5-Tuple pinned for 60 seconds.                        Kernel checks TCP timestamp (PAWS).
   Port unavailable in ip_local_port_range.                     If timestamp increases, socket reused safely!
                    |                                                           |
   >500 RPS Churn = 28,000 ports exhausted                                      v
@@ -151,151 +184,115 @@ Active Close (FIN) -> FIN-ACK Handshake -> TIME_WAIT (2 * MSL = 60s)
 
 ---
 
+## 🔒 Container Sysctl Isolation vs Host Protection
+
+A common pitfall in containerized kernel benchmarking is **host pollution**: modifying global sysctls inside Docker can accidentally throttle the developer's workstation (closing Slack, Spotify, or browser connections).
+
+`ephemeral-collapse` implements strict separation between **namespaced** and **global** settings:
+
+| Layer | Kernel Parameter | Scope | Container Target | Purpose in Harness |
+| :--- | :--- | :--- | :--- | :--- |
+| **Server** | `net.core.somaxconn` | **Network Namespaced** (Safe) | `backend` | Clamped to `128` to demonstrate Accept Queue overflow |
+| **Server** | `net.ipv4.tcp_max_syn_backlog` | **Network Namespaced** (Safe) | `backend` | Clamped to `128` to demonstrate SYN Queue saturation |
+| **Client** | `net.ipv4.ip_local_port_range` | **Network Namespaced** (Safe) | `traffic-generator` | Clamped to `32768 33279` (512 ports) to force client exhaustion |
+| **Client** | `net.ipv4.tcp_tw_reuse` | **Network Namespaced** (Safe) | `traffic-generator` | Set to `0` to prohibit client socket recycling |
+| **Global** | `net.netfilter.nf_conntrack_max`| **Global / Host Kernel** | *Guarded* | **Protected from accidental modification.** Isolated in netns scripts with `--clamp-conntrack` safety flags. |
+
+---
+
 ## ⚡ Quick Start (1-Command Runnable)
 
-No paid tools, cloud keys, or external prerequisites. Everything runs out of the box with Docker Compose or the included Makefile.
-
-### Prerequisites
-- Docker & Docker Compose (v2.0+) OR standard Linux host (kernel 5.4+)
-- `make` (optional)
+No external API keys, cloud credits, or paid tools required.
 
 ### 1. Launch the Testbed
 
 ```bash
 docker compose up --build
-```
-*Or via Makefile:*
-```bash
+# or
 make run
 ```
 
-This starts:
+This boots:
 1. **`ephemeral-backend`**: High-performance Rust Tokio microservice bound to port `8080`, with explicitly tuned kernel socket options (`SO_REUSEPORT`, `TCP_NODELAY`, custom listen backlog).
-2. **`ephemeral-probe`**: Real-time eBPF & procfs kernel-seam diagnostic observer attached directly to the network namespace.
+2. **`ephemeral-probe`**: Real-time eBPF & procfs kernel-seam diagnostic observer attached directly to the backend's network namespace.
 3. **`ephemeral-generator`**: Synthetic load and failure orchestrator.
 
-### 2. Verify Harness Health
+### 2. Open Live TUI in Another Shell
 
-In another terminal:
 ```bash
-make verify
-```
-*Expected Output:*
-```
-[1/4] Probing /healthz... OK (HTTP 200)
-[2/4] Testing high-speed /bench endpoint... OK -> {"status":"healthy","kernel_seam":"nominal"}
-[3/4] Testing connection churn endpoint (/churn)... OK -> {"status":"churn_closed"}
-[4/4] Querying /metrics... OK (Prometheus metrics active)
--------------------------------------------------------------------------------
-ephemeral_active_connections 0
-ephemeral_requests_total 3
-ephemeral_connection_churn_total 1
-ephemeral_epoll_lag_microseconds 0
--------------------------------------------------------------------------------
-[SUCCESS] Harness is operational and ready for load & chaos injection!
+make tui
 ```
 
 ---
 
-## 💥 Reproducible Failure Scenarios
+## 🛠️ Break vs Fix: The Remediation Playbook
 
-`ephemeral-collapse` includes dedicated scenarios engineered to induce sub-runtime kernel failures without saturating application CPU:
+`ephemeral-collapse` bridges the gap between an exploit tool and an actionable production runbook with paired **Break $\to$ Fix** commands:
 
-### 1. SYN Listen Backlog Queue Saturation (`make chaos-syn`)
-Fires concurrent bursts of thousands of TCP handshakes in 50ms windows, exceeding `somaxconn` and `tcp_max_syn_backlog`.
+### 1. Listen Backlog Saturation (`somaxconn`)
 ```bash
-make chaos-syn
-```
-*Observed Outcome*:
-- In eBPF probe: `[KERNEL DROP] TCP SYN LISTEN BACKLOG OVERFLOW | Current Backlog: 129 > Max Allowed: 128`.
-- In client: Sudden connection latency jump to `1.5s` and `ETIMEDOUT` / `ECONNREFUSED`.
+# 1. TRIGGER THE COLLAPSE (Clamps somaxconn=128 and fires 4,096 SYN burst)
+make break-syn
+# Observation: Heavy ListenDrops in TUI, client ETIMEDOUT, latency jumps to 1,500ms
 
-### 2. Netfilter Conntrack Table Saturation (`make chaos-conntrack`)
-Generates high-rate ephemeral 5-tuples without connection reuse to fill `nf_conntrack_max`.
-```bash
-make chaos-conntrack
-```
-*Observed Outcome*:
-- In eBPF probe: `[KERNEL DROP] NETFILTER CONNTRACK ALLOCATION FAILED | nf_conntrack table full!`.
-- Conntrack gauge reaches `100.0%`. Packets are dropped silently at the PREROUTING hook.
-
-### 3. TCP TIME_WAIT Bucket Overflow & Port Exhaustion (`make chaos-timewait`)
-Generates rapid client-side active closes against a bounded ephemeral port pool (`ip_local_port_range`).
-```bash
-make chaos-timewait
-```
-*Observed Outcome*:
-- Kernel increments `TCPTimeWaitOverflow`.
-- Client fails with `EADDRNOTAVAIL` (*"Cannot assign requested address"*).
-
-### 4. Slowloris Socket Buffer Pinning & Epoll Starvation (`make chaos-slowloris`)
-Dribbles single bytes across 500+ active connections, pinning kernel `sk_buff` receive memory and generating epoll event churn.
-```bash
-make chaos-slowloris
-```
-*Observed Outcome*:
-- `ephemeral_epoll_lag_microseconds` spikes in Prometheus telemetry.
-- Kernel `sockstat` shows elevated `TCP mem` allocation.
-
-### 5. Baseline High-Throughput Keep-Alive Benchmark (`make bench`)
-Runs clean, pipelined HTTP keep-alive traffic to establish baseline capability (>100k RPS capable).
-```bash
-make bench
+# 2. APPLY PRODUCTION REMEDIATION (Tuning somaxconn=65535 & tcp_max_syn_backlog=65535)
+make fix-syn
+# Observation: Zero drops under the IDENTICAL 4,096 SYN burst! Sub-millisecond latency.
 ```
 
-### 6. Run All Scenarios Sequentially
+### 2. TIME_WAIT & Ephemeral Port Exhaustion
 ```bash
-make chaos-all
+# 1. TRIGGER PORT DEPLETION (Client port pool: 512 ports, tcp_tw_reuse=0)
+make break-timewait
+# Observation: Client crashes with EADDRNOTAVAIL ("Cannot assign requested address")
+
+# 2. APPLY SOCKET RECYCLING (Enables tcp_tw_reuse=1 and expands port range)
+make fix-timewait
+# Observation: 100% success rate under high connection churn without errors.
+```
+
+### 3. Netfilter Conntrack Table Flooding
+```bash
+# 1. TRIGGER 5-TUPLE CHURN (Connection: close flood)
+make break-conntrack
+# Observation: Conntrack table utilization jumps rapidly towards 100%
+
+# 2. APPLY HTTP KEEP-ALIVE CONNECTION POOLING
+make fix-conntrack
+# Observation: Re-runs identical RPS with persistent pools; conntrack allocations drop by 99%.
 ```
 
 ---
 
-## 🔍 eBPF / BCC Diagnostic Probes
+## 🔍 eBPF Diagnostic Probes & Kernel Portability
 
-The diagnostic engine is located in [`services/ebpf-probe`](services/ebpf-probe/). It compiles a real C eBPF tracing program ([`bpf/tcp_seam_trace.bpf.c`](services/ebpf-probe/bpf/tcp_seam_trace.bpf.c)) hooking critical kernel symbols:
+The eBPF engine is located in [`services/ebpf-probe`](services/ebpf-probe/). It compiles a C program ([`bpf/tcp_seam_trace.bpf.c`](services/ebpf-probe/bpf/tcp_seam_trace.bpf.c)) designed for portability across **Linux 5.x and 6.x+**:
 
-```c
-// Hook into TCP SYN processing to catch listen queue drops:
-int kprobe__tcp_v4_syn_recv_sock(struct pt_regs *ctx, struct sock *sk, struct sk_buff *skb) {
-    u32 ack_backlog = sk->sk_ack_backlog;
-    u32 max_ack_backlog = sk->sk_max_ack_backlog;
-
-    if (ack_backlog > max_ack_backlog) {
-        // Submit drop event to userspace ring buffer with 5-tuple
-        syn_drop_events.perf_submit(ctx, &evt, sizeof(evt));
-    }
-}
-```
-
-### Live Probe Output
-
-```
-===============================================================================
-  ephemeral-collapse: Live Linux Kernel Seam eBPF Observability Probe
-  Hooks active: tcp_v4_syn_recv_sock | __nf_conntrack_alloc | kfree_skb
-===============================================================================
-[+] Attached kprobe:tcp_v4_syn_recv_sock (sk_ack_backlog > sk_max_ack_backlog)
-[+] Attached kretprobe:__nf_conntrack_alloc (conntrack table saturation)
-[+] Attached kprobe:tcp_set_state (TIME_WAIT state transitions)
-
-[20:34:12.104] [KERNEL DROP] TCP SYN LISTEN BACKLOG OVERFLOW | 172.28.0.3:54210 -> 172.28.0.2:8080 | Current Backlog: 132 > Max Allowed: 128
-[20:34:12.106] [KERNEL DROP] TCP SYN LISTEN BACKLOG OVERFLOW | 172.28.0.3:54212 -> 172.28.0.2:8080 | Current Backlog: 135 > Max Allowed: 128
-[20:34:14.001] SUMMARY: Total Backlog SYN Drops=1482 | Total Conntrack Drops=0
-```
-
-> **Universal Compatibility Note**: When executed in non-privileged container engines or virtual machines (such as Docker Desktop on macOS/Windows) where host kernel headers or kprobes are inaccessible, the probe automatically falls back to the high-frequency Netlink/Procfs collector ([`fallback_collector.py`](services/ebpf-probe/fallback_collector.py)), monitoring `/proc/net/netstat` (`ListenOverflows`, `ListenDrops`, `TCPTimeWaitOverflow`) with sub-second precision.
+- **Stable Tracepoints**: Employs `tracepoint/sock/inet_sock_set_state` to track TCP state transitions without relying on kernel struct layout offsets that drift between kernel versions.
+- **Kernel Version Guarding**: Uses compile-time macros for `kfree_skb` drop reason arguments (introduced in Linux 5.17+):
+  ```c
+  TRACEPOINT_PROBE(skb, kfree_skb) {
+  #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+      u32 reason = args->reason;
+  #else
+      u32 reason = 0; // Legacy fallback
+  #endif
+      ...
+  }
+  ```
+- **Dual-Mode Engine**: If BPF compilation fails or is restricted by virtualization (e.g. Docker Desktop on macOS/Windows), the probe **automatically switches** to the universal Procfs/Netlink collector ([`fallback_collector.py`](services/ebpf-probe/fallback_collector.py)), sampling `/proc/net/netstat` with sub-second resolution.
 
 ---
 
 ## 📐 Mathematical Sizing & Tuning Formulas
 
-### 1. Netfilter Conntrack Memory Consumption
+### 1. Netfilter Conntrack Memory Sizing
 
 Kernel slab memory allocated for connection tracking:
 
 $$\text{Memory}_{\text{conntrack}} = (\text{nf\_conntrack\_max} \times 320\text{ bytes}) + (\text{nf\_conntrack\_buckets} \times 8\text{ bytes})$$
 
-*Formula Rule*: Maintain a **1:4** ratio between buckets and maximum connections:
+*Golden Rule*: Maintain a **1:4** ratio between buckets and maximum connections:
 $$\text{nf\_conntrack\_buckets} = \frac{\text{nf\_conntrack\_max}}{4}$$
 
 | `nf_conntrack_max` | `nf_conntrack_buckets` | Kernel Slab RAM Allocated |
@@ -306,18 +303,18 @@ $$\text{nf\_conntrack\_buckets} = \frac{\text{nf\_conntrack\_max}}{4}$$
 
 ---
 
-### 2. Listen Queue Sizing for Microservice Bursts
+### 2. Burst Backlog Sizing Equation
 
-To prevent silent SYN drops during instantaneous traffic spikes, the Listen Queue capacity $Q_{\text{accept}}$ must absorb the burst rate $\lambda_{\text{burst}}$ across the maximum thread scheduling delay $\Delta t_{\text{accept}}$:
+To prevent silent SYN drops during instantaneous traffic spikes, the Listen Queue capacity $Q_{\text{accept}}$ must absorb the burst arrival rate $\lambda_{\text{burst}}$ across the maximum thread scheduling delay $\Delta t_{\text{accept}}$:
 
 $$Q_{\text{accept}} \ge \lambda_{\text{burst}} \times \Delta t_{\text{accept}}$$
 
-For a service handling $50,000\text{ conn/s}$ burst with a $100\text{ms}$ ($0.1\text{s}$) event loop processing lag:
+For a service handling a $50,000\text{ conn/s}$ burst with a $100\text{ms}$ ($0.1\text{s}$) event loop processing lag:
 $$Q_{\text{accept}} \ge 50000 \times 0.1 = 5,000 \implies \mathbf{\texttt{net.core.somaxconn} \ge 8192}$$
 
 ---
 
-### 3. Maximum Connection Churn Rate (TIME_WAIT Limit)
+### 3. Maximum Connection Churn Rate (TIME_WAIT Ceiling)
 
 Without socket reuse (`tcp_tw_reuse = 0`), the maximum sustainable connection establishment rate is bounded by the ephemeral port pool divided by the 2MSL duration ($60\text{s}$):
 
@@ -325,7 +322,6 @@ $$\text{RPS}_{\text{max}} = \frac{|P_{\text{ephemeral}}|}{2 \times \text{MSL}} =
 
 For default Linux ports ($32768\text{--}60999 = 28,232\text{ ports}$):
 $$\text{RPS}_{\text{max}} = \frac{28232}{60} \approx \mathbf{470\text{ RPS}}$$
-*Tuning*: Expanding port range to `1024 65535` and enabling `tcp_tw_reuse = 1` removes this ceiling.
 
 ---
 

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 // ephemeral-collapse: eBPF Kernel-Seam Diagnostic Probe
 // Traces listen backlog drops, conntrack table exhaustion, and socket buffer allocations.
+// Compatible across Linux 5.x and 6.x+ kernel ABI layouts.
 
 #include <uapi/linux/ptrace.h>
+#include <linux/version.h>
 #include <net/sock.h>
 #include <net/tcp.h>
 #include <linux/skbuff.h>
@@ -56,7 +58,7 @@ int kprobe__tcp_v4_syn_recv_sock(struct pt_regs *ctx,
     u32 ack_backlog = 0;
     u32 max_ack_backlog = 0;
 
-    // Read socket backlog limits directly from kernel struct sock
+    // Read socket backlog limits directly from kernel struct sock using safe probe reads
     bpf_probe_read_kernel(&ack_backlog, sizeof(ack_backlog), &sk->sk_ack_backlog);
     bpf_probe_read_kernel(&max_ack_backlog, sizeof(max_ack_backlog), &sk->sk_max_ack_backlog);
 
@@ -128,17 +130,17 @@ int kretprobe____nf_conntrack_alloc(struct pt_regs *ctx)
 }
 
 /**
- * Hook: tcp_set_state
- * Trace TCP state machine transitions (TIME_WAIT, SYN_SENT, ESTABLISHED)
+ * Stable Kernel Tracepoint: sock:inet_sock_set_state
+ * Available across all Linux 5.x and 6.x kernels without struct layout dependency.
+ * Tracks TCP transitions: SYN_RECV -> ESTABLISHED -> TIME_WAIT -> CLOSE.
  */
-int kprobe__tcp_set_state(struct pt_regs *ctx, struct sock *sk, int state)
-{
-    u32 u_state = (u32)state;
-    u64 *val = tcp_state_histogram.lookup(&u_state);
+TRACEPOINT_PROBE(sock, inet_sock_set_state) {
+    u32 newstate = args->newstate;
+    u64 *val = tcp_state_histogram.lookup(&newstate);
     u64 zero = 0;
     if (!val) {
-        tcp_state_histogram.update(&u_state, &zero);
-        val = tcp_state_histogram.lookup(&u_state);
+        tcp_state_histogram.update(&newstate, &zero);
+        val = tcp_state_histogram.lookup(&newstate);
     }
     if (val) {
         __sync_fetch_and_add(val, 1);
@@ -147,11 +149,15 @@ int kprobe__tcp_set_state(struct pt_regs *ctx, struct sock *sk, int state)
 }
 
 /**
- * Hook: kfree_skb
- * Traces skb drop reasons (socket rcvbuf overflow, backlog drops)
+ * Tracepoint: skb:kfree_skb
+ * Uses version check for args->reason (introduced in Linux 5.17+).
  */
 TRACEPOINT_PROBE(skb, kfree_skb) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
     u32 reason = args->reason;
+#else
+    u32 reason = 0; // Legacy fallback for Linux < 5.17
+#endif
     u64 *val = skb_drops_by_reason.lookup(&reason);
     u64 zero = 0;
     if (!val) {

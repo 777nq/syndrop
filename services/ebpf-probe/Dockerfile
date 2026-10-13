@@ -19,8 +19,9 @@ WORKDIR /app
 COPY bpf ./bpf
 COPY trace.py ./
 COPY fallback_collector.py ./
+COPY tui.py ./
 COPY entrypoint.sh ./
 
-RUN chmod +x /app/entrypoint.sh /app/trace.py /app/fallback_collector.py
+RUN chmod +x /app/entrypoint.sh /app/trace.py /app/fallback_collector.py /app/tui.py
 
 ENTRYPOINT ["/app/entrypoint.sh"]

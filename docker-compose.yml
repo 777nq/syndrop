@@ -13,12 +13,11 @@ services:
       - TCP_BACKLOG=128
       - TCP_NODELAY=1
       - SO_REUSEPORT=1
-    # Tuned kernel parameters exposed directly in the container network namespace
+    # Server-Side Network Namespaced Sysctls:
+    # Deliberately restricted to demonstrate listen backlog drops (somaxconn & SYN queue)
     sysctls:
       net.core.somaxconn: 128
       net.ipv4.tcp_max_syn_backlog: 128
-      net.ipv4.ip_local_port_range: "32768 33279"
-      net.ipv4.tcp_tw_reuse: 0
     cap_add:
       - NET_ADMIN
     restart: unless-stopped
@@ -50,6 +49,14 @@ services:
     environment:
       - TARGET_URL=http://backend:8080
       - SCENARIO=bench
+    # Client-Side Network Namespaced Sysctls:
+    # Deliberately restricted ephemeral port pool (512 ports) and disabled reuse
+    # to demonstrate EADDRNOTAVAIL and TIME_WAIT bucket overflow on outbound dials
+    sysctls:
+      net.ipv4.ip_local_port_range: "32768 33279"
+      net.ipv4.tcp_tw_reuse: 0
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - backend
     networks:
