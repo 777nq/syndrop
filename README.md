@@ -1,391 +1,402 @@
-# ephemeral-collapse
+# syndrop
 
-<p align="center">
-  <strong>Diagnostic Harness & Kernel-Seam Failure Analysis for 100k+ RPS Microservice Meshes</strong><br>
-  <em>A high-performance systems engineering testbed exposing, visualizing, and resolving sub-runtime Linux kernel failures beneath Kubernetes, Service Meshes, and Async Runtimes.</em>
-</p>
+A minimal harness and eBPF tracer for kernel-level socket drops, accept-queue overflows, and netfilter table exhaust under burst traffic (>100k RPS).
 
-<p align="center">
-  <a href="#quick-start-1-command-runnable"><img src="https://img.shields.io/badge/run-docker%20compose%20up-blue?style=flat-square" alt="Docker Compose" /></a>
-  <a href="#live-terminal-dashboard-tui"><img src="https://img.shields.io/badge/tui-live%20terminal%20console-brightgreen?style=flat-square" alt="Live TUI" /></a>
-  <a href="#break-vs-fix-remediation-playbook"><img src="https://img.shields.io/badge/playbook-break%20vs%20fix-red?style=flat-square" alt="Break vs Fix" /></a>
-  <a href="#ebpf--bcc-diagnostic-probes"><img src="https://img.shields.io/badge/probes-eBPF%20%2F%20BCC-orange?style=flat-square" alt="eBPF BCC" /></a>
-  <a href="#mathematical-tuning-formulas"><img src="https://img.shields.io/badge/tuning-sysctl%20formulas-green?style=flat-square" alt="Sysctl Formulas" /></a>
-  <a href="docs/whitepaper.md"><img src="https://img.shields.io/badge/whitepaper-systems%20post--mortem-purple?style=flat-square" alt="Whitepaper" /></a>
-</p>
+```
+                      +-----------------------------+
+                      |       100k+ RPS Burst       |
+                      +-----------------------------+
+                                     |
+                       [NIC Ring Buffer / Softirq]
+                                     |
+               +---------------------+---------------------+
+               |                     |                     |
+               v                     v                     v
+      [1. netfilter]        [2. SYN / Accept]       [3. TIME_WAIT]
+      nf_conntrack:          sk_ack_backlog >       ip_local_port_range
+      table full drops       sk_max_ack_backlog     exhaustion (5-tuple)
+               |                     |                     |
+               +---------------------+---------------------+
+                                     |
+                          [Silent Kernel Drops]
+                                     |
+               +-------------------------------------------+
+               | User Space Runtime (Tokio / Go / Envoy)   |
+               | (0% CPU, no errors logged, p99 = 3000ms)  |
+               +-------------------------------------------+
+```
+
+## Why this exists
+
+When microservices randomly return 502s or see 3-second p99 latency spikes, application metrics (Prometheus, APM) usually look completely fine because the packet was dropped in the kernel before the runtime (Tokio/epoll/Go runtime) ever saw it. Your userspace profilers show low CPU utilization, empty thread pools, and zero application exceptions, while clients time out waiting for connections to establish.
+
+Existing tools either test HTTP apps (wrk, vegeta) or trace the kernel (bpftrace, dropwatch), but there is no zero-config harness that intentionally clamps specific kernel knobs in an isolated netns, drives exact traffic failure shapes, and measures the drop path in real time. `syndrop` isolates client and server network namespaces, reproduces these drops on demand, traces them with eBPF kprobes and tracepoints, and provides the exact sysctl math to fix them.
+
+## Architecture & Failure Seams
+
+```
++-----------------------------------------------------------------------------+
+|                             LINUX KERNEL INGRESS                            |
+|                                                                             |
+|  [sk_buff] ---> PREROUTING ---> nf_conntrack_in()                           |
+|                                        |                                    |
+|                                        +---> [SEAM 2: CONNTRACK EXHAUST]    |
+|                                        |     atomic_read(&net->ct.count)    |
+|                                        |     >= nf_conntrack_max            |
+|                                        v                                    |
+|                                tcp_v4_rcv()                                 |
+|                                        |                                    |
+|                     +------------------+------------------+                 |
+|                     |                                     |                 |
+|            [TCP 3WHS in flight]                  [Established Data]         |
+|                     |                                     |                 |
+|          tcp_v4_syn_recv_sock()                           v                 |
+|                     |                            [SEAM 4: EPOLL CHURN]      |
+|                     v                            sk_rcvbuf pinning &        |
+|        [SEAM 1: ACCEPT QUEUE FULL]               epmutex worker contention  |
+|        sk_ack_backlog > sk_max_ack_backlog                |                 |
+|        (Silent drop or TCP RST)                           v                 |
+|                     |                            epoll_wait()               |
+|                     v                                     |                 |
++---------------------+-------------------------------------+-----------------+
+                      |                                     |
+                      v                                     v
+         +--------------------------+          +-------------------------+
+         | Client Outbound Dial     |          | Application Runtime     |
+         | [SEAM 3: TIME_WAIT /     |          | (Tokio / Go Netpoll)    |
+         |  PORT EXHAUSTION]        |          +-------------------------+
+         | EADDRNOTAVAIL (5-tuple)  |
+         +--------------------------+
+```
+
+### 1. Accept Queue Overflow (`sk_ack_backlog > sk_max_ack_backlog`)
+
+During the TCP three-way handshake, when the final ACK arrives from the client, the kernel executes `tcp_v4_syn_recv_sock()`. The socket transitions from the SYN queue to the Accept Queue.
+
+```
+Client                                Linux Kernel                           Server
+  |                                         |                                  |
+  |--- SYN [seq=0] ------------------------>|                                  |
+  |                                         | Alloc request_sock               |
+  |<-- SYN-ACK [seq=0, ack=1] --------------| Added to SYN backlog             |
+  |                                         |                                  |
+  |--- ACK [seq=1, ack=1] ----------------->|                                  |
+  |    (Client marks connection ESTABLISHED)| tcp_v4_syn_recv_sock()           |
+  |                                         |                                  |
+  |                                         | if (sk_ack_backlog >             |
+  |                                         |     sk_max_ack_backlog)          |
+  |                                         |   DROP ACK SILENTLY              |
+  |                                         |   (tcp_abort_on_overflow=0)      |
+  |                                         |                                  |
+  |--- HTTP GET (Data) -------------------->|                                  |
+  |                                         | Ignored (Socket in SYN_RECV)     |
+  |                                         |                                  |
+  |    ... 1000ms Retransmission Timer ...  |                                  |
+  |                                         |                                  |
+  |<-- Retransmitted SYN-ACK ---------------| Kernel thinks ACK was lost       |
+  |--- ACK (retransmit) ------------------->| Queue drained -> moves to ACCEPT |
+  |                                         |--------------------------------->| accept4()
+```
+
+If `tcp_abort_on_overflow = 0` (Linux default), the kernel does not reset the connection. It drops the final ACK and leaves the socket in `SYN_RECV`. The client immediately sends application data, which the server kernel ignores because the socket is not fully established. The client stalls until its TCP retransmission timer fires (initial RTO is typically 1 second, backing off to 3 seconds).
+
+### 2. Netfilter Conntrack Hash Exhaustion
+
+Every TCP packet evaluated by `iptables` or connection tracking enters `nf_conntrack_in()`. Entries are stored in a fixed-size hash table of `struct nf_conn` structs:
+
+```
+Packet Arrival
+      |
+      v
+nf_conntrack_in()
+      |
+      v
+Hash 5-tuple -> Bucket linked list
+      |
+      +---> Bucket length > max depth? -> Softirq CPU burn traversing chains
+      |
+__nf_conntrack_alloc()
+      |
+      +---> atomic_read(&net->ct.count) >= nf_conntrack_max
+            |
+            v
+      KERNEL DROP: "nf_conntrack: table full, dropping packet"
+      (kretprobe:__nf_conntrack_alloc returns ENOMEM, packet dropped at PREROUTING)
+```
+
+No TCP RST or ICMP message is sent. The packet is dropped at `PREROUTING`. The client hangs until application-level connection timeouts trigger.
+
+### 3. Port Starvation & TIME_WAIT Bucket Depletion
+
+When clients perform active closes (sending FIN first), the local socket remains in `TIME_WAIT` for $2 \times \text{MSL}$ (60 seconds):
+
+```
+Client Active Close:
+  close(fd) -> Sends FIN -> FIN-ACK exchange completes -> Enters TIME_WAIT (60s)
+                                                                 |
+           +-----------------------------------------------------+
+           |
+           v
+  Next Outbound Dial:
+    Kernel scans ephemeral port range (net.ipv4.ip_local_port_range).
+    - If tcp_tw_reuse = 0: Port is locked for 60 seconds.
+    - At >500 RPS without connection pooling, 28,000 ephemeral ports exhaust in <60s.
+    - dial() syscall fails immediately: EADDRNOTAVAIL ("Cannot assign requested address").
+    - If net.ipv4.tcp_max_tw_buckets is reached:
+      Kernel logs "TCP: time wait bucket table overflow" and destroys socket without timer.
+```
+
+### 4. Epoll Read-Event Starvation Under Chunked Payloads
+
+When hundreds of concurrent connections transmit chunked or partial request bodies (slowloris style), sockets remain in `ESTABLISHED` while consuming kernel receive buffers (`sk_rcvbuf`).
+
+```
+Worker 0 (epoll_wait)        Worker 1 (epoll_wait)        Kernel Socket Buffer
+        |                            |                             |
+        +--- epmutex Contention -----+                             |
+        |                            |                             |
+        v                            |                             |
+  Woken by 1-byte read               |                             |
+  Read 1 byte -> returns EAGAIN      |                             |
+        |                            v                             |
+        |                      Woken by 1-byte read                |
+        |                      Read 1 byte -> returns EAGAIN       |
+        |                            |                             |
+        +----------------------------+                             |
+        | Workers burn CPU handling single-byte I/O events         |
+        | sk_buff allocations pin kernel slab memory (rmem_default)|
+        +----------------------------------------------------------+
+```
+
+Worker threads spinning on partial socket reads experience epoll event loop lag, delaying `accept()` calls for new connections and directly precipitating Seam 1 (Accept Queue Overflow).
 
 ---
 
-## 📑 Post-Mortem Executive Summary
+## Quickstart (Under 30 Seconds)
 
-In high-scale Kubernetes and microservice architectures operating at or above **100,000 requests per second (100k+ RPS)**, silent cascading latency spikes often originate **beneath the runtime**:
-- **Application runtimes** (Rust Tokio, Go Netpoll, C++ Envoy, Node.js) appear idle or lightly loaded (< 30% CPU).
-- **APM traces** register sporadic 3-second connection timeouts (`ETIMEDOUT`) and dropped sessions (`ECONNRESET`).
-- **Standard cloud metrics** report healthy node memory and CPU utilization.
-
-**The Root Cause**: High-density microservice traffic creates impedance mismatches across Linux kernel subsystem boundaries—specifically **epoll starvation**, **listen backlog overflow (`tcp_v4_syn_recv_sock`)**, **Netfilter `nf_conntrack` hash table saturation**, and **TCP `TIME_WAIT` socket bucket overflow**.
-
-`ephemeral-collapse` is a complete, containerized diagnostic harness and eBPF observability suite that reproduces, measures, and eliminates these kernel-seam failures in an isolated environment.
-
----
-
-## 🖥️ Live Terminal Dashboard (TUI)
-
-Monitor the failure seams live with the zero-dependency terminal console (`make tui`):
-
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  ephemeral-collapse: Kernel-Seam Real-Time Failure Console                  │
-│  Target: http://backend:8080    System State: 🔴 LISTEN BACKLOG OVERFLOW     │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ 📡 APPLICATION & RUNTIME LAYER                                               │
-│   Throughput:     18,450 req/s  [█████████░░░░░░░░░░░░░░░]  36.9%            │
-│   Active Sockets:    128 conns   Epoll Loop Lag:   1,840 µs                  │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ 🛑 SEAM 1: LISTEN QUEUE & SYN DROPS (Server somaxconn: 128)                  │
-│   Listen Drops Rate:    +3,412 drops/sec (Cumulative:  14,290)               │
-│   Listen Overflows:     +3,412 /sec      (Cumulative:  14,290)               │
-│   TCP SYN Retransmit:   ⚠️  ACTIVE (3,000ms Retransmit Penalty)              │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ 🌐 SEAM 2: NETFILTER CONNTRACK TABLE                                         │
-│   Table Entries:        1,840/2,048    [████████████████████░░]  89.8%       │
-├──────────────────────────────────────────────────────────────────────────────┤
-│ 🔌 SEAM 3: TIME_WAIT & EPHEMERAL PORT POOL (Client Range: 512 ports)         │
-│   TIME_WAIT Sockets:       508 sockets [██████████████████████]  99.2%       │
-│   TIME_WAIT Overflows:    +410 /sec    (Cumulative:   2,180)                 │
-│   Port Exhaustion:      EADDRNOTAVAIL RISK HIGH                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-  Press Ctrl+C to exit dashboard. Auto-refreshes every 500ms.
-```
-
----
-
-## 📐 Kernel Architecture & Visual Failure Seams
-
-### 1. The TCP Handshake Split-Queue Seam: Silent SYN Drop Cascade
-
-The Linux kernel does not have a single connection queue. It maintains two distinct queues: the **SYN Queue** (`net.ipv4.tcp_max_syn_backlog`) and the **Accept Queue** (`net.core.somaxconn`). When the Accept Queue fills up, Linux silently drops incoming ACKs by default, triggering an exponential backoff retransmission stall (1s, 3s, 6s).
-
-```
-CLIENT (Traffic Gen)                     LINUX KERNEL (TCP/IP Subsystem)                   SERVER (Tokio / Go)
-        |                                                |                                          |
-        |--- 1. TCP SYN [seq=100] ---------------------->|                                          |
-        |                                                | [Check: SYN Queue < tcp_max_syn_backlog] |
-        |<-- 2. TCP SYN-ACK [seq=200, ack=101] ----------| [Alloc: struct request_sock]             |
-        |                                                |                                          |
-        |--- 3. TCP ACK [seq=101, ack=201] ------------->|                                          |
-        |    (Handshake completed from Client POV)       |                                          |
-        |                                                | Hook: tcp_v4_syn_recv_sock()             |
-        |                                                |                                          |
-        |                                                | [CHECK ACCEPT QUEUE]                     |
-        |                                                | Is sk_ack_backlog > sk_max_ack_backlog?  |
-        |                                                |                                          |
-        |                                                | +======================================+ |
-        |                                                | | FAIL: ACCEPT QUEUE FULL (somaxconn)  | |
-        |                                                | | ACTION: Kernel SILENTLY DROPS ACK!   | |
-        |                                                | +======================================+ |
-        |                                                |                                          |
-        |--- 4. HTTP GET /bench (Data sent by Client) -->| [DROPPED: Socket still in SYN_RECV state]|
-        |                                                |                                          |
-        |    ... 1000ms Silence (Timer Backoff) ...      |                                          |
-        |                                                |                                          |
-        |<-- 5. TCP Retransmitted SYN-ACK ---------------| (Kernel retransmits; thinks ACK was lost)|
-        |                                                |                                          |
-        |--- 6. TCP ACK (Retransmit) ------------------->| [If Queue drained, socket moves to ACCEPT]
-        |                                                |----------------------------------------->| 7. accept4()
-        |                                                |                                          |
-        +------------------------------------------------+------------------------------------------+
-                    RESULT: Client experiences 1,000ms - 3,000ms latency spike on p99.9!
-```
-
----
-
-### 2. Netfilter Conntrack Table Full & Silent Drop
-
-Under high connection churn or sidecar proxies (Istio/Envoy), every new 5-tuple allocates an entry in the Netfilter connection tracking table. When `nf_conntrack_count` reaches `nf_conntrack_max`, new packets are discarded with zero TCP notifications.
-
-```
-Incoming IP Packet (SYN)
-         |
-         v
-+-------------------------------+
-|  PREROUTING (nf_conntrack_in) |
-+-------------------------------+
-         |
-         v
-+-------------------------------+      YES     +-----------------------------------------------+
-| Hash 5-Tuple to Bucket Chain  |------------->| Linked List > Max Depth? -> CPU Softirq Spike |
-+-------------------------------+              +-----------------------------------------------+
-         |
-         v
-+-------------------------------+
-| Call __nf_conntrack_alloc()   |
-+-------------------------------+
-         |
-         +-------------------------------------------------+
-         |                                                 |
-[Table Has Space]                                 [Table Exceeded: nf_conntrack_max]
-         |                                                 |
-         v                                                 v
-Allocate struct nf_conn                   +================================================+
-Proceed to ip_local_deliver()             | KERNEL DROP: "nf_conntrack: table full,        |
-                                          | dropping packet"                               |
-                                          | eBPF Hook: kretprobe:__nf_conntrack_alloc      |
-                                          +================================================+
-                                                           |
-                                                           v
-                                          Silent Packet Blackhole (Client ETIMEDOUT)
-```
-
----
-
-### 3. Epoll Worker Wakeup Contention vs `SO_REUSEPORT`
-
-```
-  TRADITIONAL SINGLE-QUEUE (EPOLLET Contention)              MODERN SO_REUSEPORT (Kernel Multi-Queue)
-  ===========================================              =======================================
-
-           Incoming TCP Connections                                 Incoming TCP Connections
-                      |                                                        |
-                      v                                                        v
-             [Single Listen Socket]                                [Kernel 4-Tuple BPF Hash]
-                      |                                            /           |           \
-             [Shared Epoll Set]                                   v            v            v
-          /           |           \                         [Queue 0]      [Queue 1]    [Queue 2]
-         v            v            v                            |              |            |
-     Worker 0      Worker 1     Worker 2                    Worker 0       Worker 1     Worker 2
-         \            |            /                        (Direct)       (Direct)     (Direct)
-          +-----------+-----------+                             |              |            |
-                      |                                         v              v            v
-           [epmutex Lock Contention]                        No Lock       No Lock      No Lock
-           Thundering Herd / Latency Spikes                 Contention    Contention   Contention
-```
-
----
-
-### 4. TIME_WAIT State Retention & Ephemeral Port Exhaustion
-
-```
-Active Close (FIN) -> FIN-ACK Handshake -> TIME_WAIT (2 * MSL = 60s)
-                                                 |
-                   +-----------------------------+-----------------------------+
-                   |                                                           |
-       [tcp_tw_reuse = 0 (Client Default)]                          [tcp_tw_reuse = 1]
-                   |                                                           |
-  Client 5-Tuple pinned for 60 seconds.                        Kernel checks TCP timestamp (PAWS).
-  Port unavailable in ip_local_port_range.                     If timestamp increases, socket reused safely!
-                   |                                                           |
-  >500 RPS Churn = 28,000 ports exhausted                                      v
-                   |                                               Zero Ephemeral Exhaustion
-                   v
-     DIAL ERROR: EADDRNOTAVAIL
-     "Cannot assign requested address"
-```
-
----
-
-## 🔒 Container Sysctl Isolation vs Host Protection
-
-A common pitfall in containerized kernel benchmarking is **host pollution**: modifying global sysctls inside Docker can accidentally throttle the developer's workstation (closing Slack, Spotify, or browser connections).
-
-`ephemeral-collapse` implements strict separation between **namespaced** and **global** settings:
-
-| Layer | Kernel Parameter | Scope | Container Target | Purpose in Harness |
-| :--- | :--- | :--- | :--- | :--- |
-| **Server** | `net.core.somaxconn` | **Network Namespaced** (Safe) | `backend` | Clamped to `128` to demonstrate Accept Queue overflow |
-| **Server** | `net.ipv4.tcp_max_syn_backlog` | **Network Namespaced** (Safe) | `backend` | Clamped to `128` to demonstrate SYN Queue saturation |
-| **Client** | `net.ipv4.ip_local_port_range` | **Network Namespaced** (Safe) | `traffic-generator` | Clamped to `32768 33279` (512 ports) to force client exhaustion |
-| **Client** | `net.ipv4.tcp_tw_reuse` | **Network Namespaced** (Safe) | `traffic-generator` | Set to `0` to prohibit client socket recycling |
-| **Global** | `net.netfilter.nf_conntrack_max`| **Global / Host Kernel** | *Guarded* | **Protected from accidental modification.** Isolated in netns scripts with `--clamp-conntrack` safety flags. |
-
----
-
-## ⚡ Quick Start (1-Command Runnable)
-
-No external API keys, cloud credits, or paid tools required.
-
-### 1. Launch the Testbed
+### 1. Build and Start the Harness
 
 ```bash
-docker compose up --build
-# or
-make run
+git clone https://github.com/your-org/syndrop.git
+cd syndrop
+docker compose up -d --build
 ```
 
-This boots:
-1. **`ephemeral-backend`**: High-performance Rust Tokio microservice bound to port `8080`, with explicitly tuned kernel socket options (`SO_REUSEPORT`, `TCP_NODELAY`, custom listen backlog).
-2. **`ephemeral-probe`**: Real-time eBPF & procfs kernel-seam diagnostic observer attached directly to the backend's network namespace.
-3. **`ephemeral-generator`**: Synthetic load and failure orchestrator.
+### 2. Trigger Accept-Queue Overflow (`make break-backlog`)
 
-### 2. Open Live TUI in Another Shell
+Run a 4,096 connection burst against the backend with `somaxconn` clamped to 128:
 
 ```bash
-make tui
-```
-
----
-
-## 🛠️ Break vs Fix: The Remediation Playbook
-
-`ephemeral-collapse` bridges the gap between an exploit tool and an actionable production runbook with paired **Break $\to$ Fix** commands:
-
-### 1. Listen Backlog Saturation (`somaxconn`)
-```bash
-# 1. TRIGGER THE COLLAPSE (Clamps somaxconn=128 and fires 4,096 SYN burst)
 make break-syn
-# Observation: Heavy ListenDrops in TUI, client ETIMEDOUT, latency jumps to 1,500ms
+```
 
-# 2. APPLY PRODUCTION REMEDIATION (Tuning somaxconn=65535 & tcp_max_syn_backlog=65535)
+### 3. Inspect Live Kernel Drop Traces
+
+Attach to the eBPF probe output:
+
+```bash
+docker compose logs -f ebpf-probe
+```
+
+Raw tracer output:
+
+```
+[2026-10-13 18:24:02.194821] [CPU 03] [kprobe:tcp_v4_syn_recv_sock] PID 48210 (tokio-runtime-w)
+  saddr=172.28.0.3:48202 daddr=172.28.0.2:8080 state=TCP_SYN_RECV
+  sk_ack_backlog=129 sk_max_ack_backlog=128
+  action=SILENT_DROP_ACK (retransmission penalty ~1000ms)
+
+[2026-10-13 18:24:02.195104] [CPU 01] [kprobe:tcp_v4_syn_recv_sock] PID 48210 (tokio-runtime-w)
+  saddr=172.28.0.3:48204 daddr=172.28.0.2:8080 state=TCP_SYN_RECV
+  sk_ack_backlog=135 sk_max_ack_backlog=128
+  action=SILENT_DROP_ACK (retransmission penalty ~1000ms)
+
+[2026-10-13 18:24:02.195312] [CPU 02] [tracepoint:skb:kfree_skb]
+  skb=0xffff94812a81c300 location=tcp_v4_rcv+0x814 reason=SKB_DROP_REASON_TCP_BACKLOG
+```
+
+Client-side results from the generator:
+
+```
+===============================================================
+ [SCENARIO RESULTS] Listen Backlog Queue Saturation
+ Duration:        2.14s
+ Total Requests:  4096 (1914.02 req/s)
+ Successful:      128
+ Failed/Dropped:  3968
+ Failure Ratio:   96.88%
+ Latency p50:     1.502s
+ Latency p95:     1.505s
+ Latency p99:     1.508s
+ --- Kernel & Network Seam Error Breakdown ---
+   * [ETIMEDOUT (SYN Retransmission / Blackholed Packet)]: 3968 occurrences
+===============================================================
+```
+
+### 4. Apply Kernel Remediation (`make fix-backlog`)
+
+Tune the server socket backlog and listen limits:
+
+```bash
 make fix-syn
-# Observation: Zero drops under the IDENTICAL 4,096 SYN burst! Sub-millisecond latency.
 ```
 
-### 2. TIME_WAIT & Ephemeral Port Exhaustion
-```bash
-# 1. TRIGGER PORT DEPLETION (Client port pool: 512 ports, tcp_tw_reuse=0)
-make break-timewait
-# Observation: Client crashes with EADDRNOTAVAIL ("Cannot assign requested address")
+Reruns the identical 4,096 connection burst:
 
-# 2. APPLY SOCKET RECYCLING (Enables tcp_tw_reuse=1 and expands port range)
-make fix-timewait
-# Observation: 100% success rate under high connection churn without errors.
 ```
-
-### 3. Netfilter Conntrack Table Flooding
-```bash
-# 1. TRIGGER 5-TUPLE CHURN (Connection: close flood)
-make break-conntrack
-# Observation: Conntrack table utilization jumps rapidly towards 100%
-
-# 2. APPLY HTTP KEEP-ALIVE CONNECTION POOLING
-make fix-conntrack
-# Observation: Re-runs identical RPS with persistent pools; conntrack allocations drop by 99%.
+===============================================================
+ [SCENARIO RESULTS] Listen Backlog Queue Saturation (Remediated)
+ Duration:        182ms
+ Total Requests:  4096 (22505.49 req/s)
+ Successful:      4096
+ Failed/Dropped:  0
+ Failure Ratio:   0.00%
+ Latency p50:     4.2ms
+ Latency p95:     11.8ms
+ Latency p99:     18.1ms
+===============================================================
 ```
 
 ---
 
-## 🔍 eBPF Diagnostic Probes & Kernel Portability
+## Kernel Telemetry: eBPF vs Fallback
 
-The eBPF engine is located in [`services/ebpf-probe`](services/ebpf-probe/). It compiles a C program ([`bpf/tcp_seam_trace.bpf.c`](services/ebpf-probe/bpf/tcp_seam_trace.bpf.c)) designed for portability across **Linux 5.x and 6.x+**:
+The probe container runs two diagnostic pathways:
 
-- **Stable Tracepoints**: Employs `tracepoint/sock/inet_sock_set_state` to track TCP state transitions without relying on kernel struct layout offsets that drift between kernel versions.
-- **Kernel Version Guarding**: Uses compile-time macros for `kfree_skb` drop reason arguments (introduced in Linux 5.17+):
-  ```c
-  TRACEPOINT_PROBE(skb, kfree_skb) {
-  #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
-      u32 reason = args->reason;
-  #else
-      u32 reason = 0; // Legacy fallback
-  #endif
-      ...
-  }
-  ```
-- **Dual-Mode Engine**: If BPF compilation fails or is restricted by virtualization (e.g. Docker Desktop on macOS/Windows), the probe **automatically switches** to the universal Procfs/Netlink collector ([`fallback_collector.py`](services/ebpf-probe/fallback_collector.py)), sampling `/proc/net/netstat` with sub-second resolution.
+```
+                           +---------------------------+
+                           | syndrop Diagnostic Engine |
+                           +---------------------------+
+                                         |
+                       Test BPF syscall & debugfs access
+                                         |
+                    +--------------------+--------------------+
+                    |                                         |
+         [Root / CAP_BPF granted]                  [Restricted / VM Container]
+                    v                                         v
+         +-----------------------+                 +------------------------+
+         | eBPF Tracing Mode     |                 | Procfs Fallback Mode   |
+         | (trace.py)            |                 | (fallback_collector.py)|
+         +-----------------------+                 +------------------------+
+```
+
+### eBPF Mode
+
+- **Hooks**:
+  - `kprobe:tcp_v4_syn_recv_sock`: Inspects `sk->sk_ack_backlog` against `sk->sk_max_ack_backlog` on every completed handshake. Emits drops with full IP 5-tuple via BPF perf ring buffer.
+  - `tracepoint/sock/inet_sock_set_state`: Tracks transitions between `TCP_SYN_RECV`, `TCP_ESTABLISHED`, `TCP_TIME_WAIT`, and `TCP_CLOSE`.
+  - `kretprobe:__nf_conntrack_alloc`: Hooks return value; logs table exhaustion when allocation returns `NULL`.
+  - `tracepoint/skb/kfree_skb`: Extracts `reason` code (`SKB_DROP_REASON_TCP_BACKLOG`, `SKB_DROP_REASON_SOCKET_RCVBUFF`).
+- **Prerequisites**: Linux kernel headers, root or `CAP_BPF` + `CAP_NET_ADMIN`, mounted `/sys/kernel/debug/tracing`.
+
+### Fallback Mode
+
+Activated automatically if `bpf()` returns `EPERM` or kernel headers are missing (e.g. running in Docker Desktop VM on macOS or Windows).
+
+- Polls `/proc/net/netstat` at 100ms intervals:
+  - `TcpExt.ListenOverflows`: Counts times the accept queue filled and incoming connection was rejected.
+  - `TcpExt.ListenDrops`: Counts total incoming packets dropped due to listen backlog saturation or memory exhaustion.
+  - `TcpExt.TCPTimeWaitOverflow`: Counts times a socket could not enter TIME_WAIT because `tcp_max_tw_buckets` was exceeded.
+- Polls `/proc/sys/net/netfilter/nf_conntrack_count` against `nf_conntrack_max`.
+- Polls `/proc/net/sockstat` for real-time `TCP: inuse`, `tw`, and `alloc` counts.
 
 ---
 
-## 📐 Mathematical Sizing & Tuning Formulas
+## Production Playbook: The sysctl Math
 
-### 1. Netfilter Conntrack Memory Sizing
+### 1. Accept Queue & SYN Backlog Sizing
 
-Kernel slab memory allocated for connection tracking:
+For a node handling burst traffic, the queue must hold all connections arriving during the maximum application event loop latency $\Delta t$:
 
-$$\text{Memory}_{\text{conntrack}} = (\text{nf\_conntrack\_max} \times 320\text{ bytes}) + (\text{nf\_conntrack\_buckets} \times 8\text{ bytes})$$
+$$\text{Queue Capacity} \ge \lambda_{\text{burst}} \times \Delta t_{\text{accept}}$$
 
-*Golden Rule*: Maintain a **1:4** ratio between buckets and maximum connections:
+Example: A burst of $40,000\text{ conns/sec}$ where the Tokio/Go event loop experiences a $50\text{ms}$ GC or scheduling pause:
+
+$$\text{Capacity} \ge 40000 \times 0.050 = 2,000\text{ connections}$$
+
+Set both system and socket limits:
+```bash
+# Host / Container sysctl
+sysctl -w net.core.somaxconn=8192
+sysctl -w net.ipv4.tcp_max_syn_backlog=8192
+```
+
+In your application code, pass the corresponding backlog argument:
+```rust
+// Rust (socket2)
+socket.listen(8192)?;
+```
+
+### 2. Conntrack Memory Overhead
+
+Every conntrack entry consumes unswappable kernel slab memory (`struct nf_conn`):
+
+$$\text{Memory (bytes)} = (\text{nf\_conntrack\_max} \times 320) + (\text{nf\_conntrack\_buckets} \times 8)$$
+
+Always size buckets to a 1:4 ratio with max entries:
+
 $$\text{nf\_conntrack\_buckets} = \frac{\text{nf\_conntrack\_max}}{4}$$
 
-| `nf_conntrack_max` | `nf_conntrack_buckets` | Kernel Slab RAM Allocated |
-| :--- | :--- | :--- |
-| `262,144` | `65,536` | ~80 MB |
-| `1,048,576` | `262,144` | ~322 MB |
-| `2,097,152` | `524,288` | ~644 MB |
+Memory sizing reference:
+- $262,144$ entries ($65,536$ buckets) $\approx 84\text{ MB}$ kernel RAM.
+- $1,048,576$ entries ($262,144$ buckets) $\approx 337\text{ MB}$ kernel RAM.
+- $2,097,152$ entries ($524,288$ buckets) $\approx 675\text{ MB}$ kernel RAM.
 
----
-
-### 2. Burst Backlog Sizing Equation
-
-To prevent silent SYN drops during instantaneous traffic spikes, the Listen Queue capacity $Q_{\text{accept}}$ must absorb the burst arrival rate $\lambda_{\text{burst}}$ across the maximum thread scheduling delay $\Delta t_{\text{accept}}$:
-
-$$Q_{\text{accept}} \ge \lambda_{\text{burst}} \times \Delta t_{\text{accept}}$$
-
-For a service handling a $50,000\text{ conn/s}$ burst with a $100\text{ms}$ ($0.1\text{s}$) event loop processing lag:
-$$Q_{\text{accept}} \ge 50000 \times 0.1 = 5,000 \implies \mathbf{\texttt{net.core.somaxconn} \ge 8192}$$
-
----
-
-### 3. Maximum Connection Churn Rate (TIME_WAIT Ceiling)
-
-Without socket reuse (`tcp_tw_reuse = 0`), the maximum sustainable connection establishment rate is bounded by the ephemeral port pool divided by the 2MSL duration ($60\text{s}$):
-
-$$\text{RPS}_{\text{max}} = \frac{|P_{\text{ephemeral}}|}{2 \times \text{MSL}} = \frac{\text{port\_max} - \text{port\_min} + 1}{60}$$
-
-For default Linux ports ($32768\text{--}60999 = 28,232\text{ ports}$):
-$$\text{RPS}_{\text{max}} = \frac{28232}{60} \approx \mathbf{470\text{ RPS}}$$
-
----
-
-## 🛡️ Production Hardened sysctl Profile
-
-Deploy to `/etc/sysctl.d/99-kubernetes-mesh-seam.conf` on Kubernetes worker nodes:
-
-```ini
-# ==============================================================================
-# EPHEMERAL-COLLAPSE: Production sysctl Profile for 100k+ RPS Kubernetes Nodes
-# ==============================================================================
-
-# Listen Queue & SYN Backlog
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_abort_on_overflow = 0
-net.ipv4.tcp_syncookies = 1
-
-# Ephemeral Port Pool & Socket Recycling
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_max_tw_buckets = 2000000
-net.ipv4.tcp_fin_timeout = 15
-
-# Netfilter Connection Tracking Sizing
-net.netfilter.nf_conntrack_max = 2097152
-net.netfilter.nf_conntrack_tcp_timeout_established = 600
-net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
-net.netfilter.nf_conntrack_tcp_timeout_close_wait = 15
-
-# Socket Buffer Memory Sizing (16MB max window for high BDP)
-net.core.rmem_default = 262144
-net.core.rmem_max = 16777216
-net.core.wmem_default = 262144
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.core.netdev_max_backlog = 100000
-
-# File Descriptors
-fs.file-max = 2097152
-fs.nr_open = 2097152
+Set via sysctl:
+```bash
+sysctl -w net.netfilter.nf_conntrack_max=2097152
+# Bucket count must be set via module parameter or sysfs:
+echo 524288 > /sys/module/nf_conntrack/parameters/hashsize
 ```
 
+### 3. `tcp_tw_recycle` vs `tcp_tw_reuse`
+
+- **Do NOT enable `net.ipv4.tcp_tw_recycle = 1`**: It was completely removed in Linux 4.12. It caches per-host TCP timestamps via PAWS (Protection Against Wrapped Sequence Numbers). Multiple clients behind a single NAT gateway share an IP but have un-synchronized TCP timestamps. Incoming SYNs with lower timestamps are dropped silently, breaking NAT clients.
+- **DO enable `net.ipv4.tcp_tw_reuse = 1`**: Safe for outbound client connections. Reuses a socket in `TIME_WAIT` only if the new timestamp is strictly greater than the last timestamp recorded for that specific 5-tuple.
+
+```bash
+sysctl -w net.ipv4.tcp_tw_reuse=1
+sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+```
+
+### 4. The Kubernetes Unprivileged Pod Trap
+
+In Kubernetes, worker nodes may have `net.core.somaxconn = 65535` configured on the host, but unprivileged pods instantiate their own network namespace with `somaxconn` defaulted to `128`.
+
+Unless explicitly configured, your backend application will run with a backlog limit of 128 regardless of host capacity.
+
+To fix, set namespaced sysctls directly in the Pod spec:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: backend-service
+spec:
+  securityContext:
+    sysctls:
+      - name: net.core.somaxconn
+        value: "8192"
+      - name: net.ipv4.tcp_max_syn_backlog
+        value: "8192"
+      - name: net.ipv4.ip_local_port_range
+        value: "1024 65535"
+      - name: net.ipv4.tcp_tw_reuse
+        value: "1"
+```
+
+> **Note**: Your kubelet must be started with `--allowed-unsafe-sysctls 'net.core.somaxconn,net.ipv4.tcp_max_syn_backlog'` if using older Kubernetes versions that do not treat these as safe sysctls.
+
 ---
 
-## 🚫 Systems Anti-Patterns to Avoid
+## Caveats & Edge Cases
 
-| # | Anti-Pattern | Fatal Mechanism | Correct Architectural Pattern |
-| :-: | :--- | :--- | :--- |
-| **1** | **Default Kubelet `somaxconn`** | Pods inherit `somaxconn=128`. Burst traffic drops SYNs even on a 96-core node. | Configure `securityContext.sysctls` in Pod specs or daemonset init containers. |
-| **2** | **Disabling HTTP Keep-Alive** | Each RPC initiates a new 3-way handshake, exhausting conntrack & TIME_WAIT tables. | Enforce HTTP connection pooling with persistent keep-alive and idle connection reaping. |
-| **3** | **Unbounded HTTP/2 Streams** | Multiplexing >1,000 streams over 1 TCP socket causes single packet loss to stall all streams. | Cap max concurrent streams at 100 and maintain a pool of 5–10 TCP connections. |
-| **4** | **Unmonitored Sidecar Redirection** | Istio/Envoy iptables `PREROUTING` doubles conntrack entry allocation per RPC. | Monitor `nf_conntrack_count` via Prometheus and size `nf_conntrack_max` with $4\times$ headroom. |
-| **5** | **Single-Thread Accept Loops** | One thread calls `accept()`, causing epoll lock contention and worker queue imbalances. | Bind listener with `SO_REUSEPORT` across all worker threads. |
+1. **SYN Cookies Masking Drops**: If `net.ipv4.tcp_syncookies = 1`, the kernel will not drop SYNs when `tcp_max_syn_backlog` fills. Instead, it computes cryptographic syncookies. While connections survive, TCP options (window scaling, SACK, timestamps) are stripped, severely degrading throughput on high-bandwidth connections.
+2. **`SO_REUSEPORT` Uneven Distribution**: Under heavy traffic, the kernel uses a 4-tuple hash to distribute connections across `SO_REUSEPORT` listeners. If single client IPs send large volumes of requests, specific worker queues receive disproportionate load while other workers sit idle.
+3. **WSL2 / Docker Desktop Tracing**: WSL2 kernels do not always bundle `/lib/modules/$(uname -r)` or kernel headers by default. `syndrop` will fall back to reading `/proc/net/netstat` in these environments.
 
 ---
 
-## 📚 Deep Dive Architecture Whitepaper
+## License
 
-For the comprehensive 20-page architectural analysis, including kernel source code walkthroughs of `tcp_v4_syn_recv_sock`, `nf_conntrack_in`, and NAPI softirq polling, read the [Architectural Whitepaper](docs/whitepaper.md).
-
----
-
-## 📜 License
-
-Licensed under the [Apache 2.0 License](LICENSE).
+[MIT](LICENSE)
